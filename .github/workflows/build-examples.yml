@@ -1,45 +1,232 @@
-name: Build and Test Examples
+name: Build Alpine Auto-Wipe ISO
 
 on:
-  workflow_call:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  build:
-    timeout-minutes: 30
+  build-iso:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: examples
-
+    
     steps:
-      - uses: actions/checkout@v3
-
-      - name: Validate Gradle wrapper
-        uses: gradle/wrapper-validation-action@v1
-
-      - name: Set up Java 17
-        uses: actions/setup-java@v3
-        with:
-          java-version: 17
-          distribution: 'zulu'
-
-      - name: Set up Gradle cache
-        uses: gradle/gradle-build-action@v2
-
-      - name: Set up Maven cache
-        uses: actions/cache@v3
-        with:
-          path: ~/.m2/repository
-          key: ${{ runner.os }}-maven-${{ hashFiles('**/pom.xml') }}
-          restore-keys: ${{ runner.os }}-maven-
-
-      - name: Build examples with Gradle
-        run: ./gradlew clean build
-
-      - name: Archive examples failure build reports
-        uses: actions/upload-artifact@v3
-        if: failure()
-        with:
-          name: build-examples-reports
-          path: ./examples/**/build/reports
-          retention-days: 7
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y wget cpio gzip xorriso isolinux syslinux-utils
+    
+    - name: Download Alpine Linux
+      run: |
+        wget https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-standard-3.19.0-x86_64.iso
+        mkdir -p /tmp/alpine-iso
+        mkdir -p /tmp/alpine-new
+    
+    - name: Extract Alpine ISO
+      run: |
+        sudo mount -o loop alpine-standard-3.19.0-x86_64.iso /tmp/alpine-iso
+        sudo cp -r /tmp/alpine-iso/* /tmp/alpine-new/
+        sudo umount /tmp/alpine-iso
+        sudo chmod -R u+w /tmp/alpine-new
+    
+    - name: Create auto-wipe script
+      run: |
+        sudo mkdir -p /tmp/alpine-new/scripts
+        sudo tee /tmp/alpine-new/scripts/autowipe.sh > /dev/null << 'EOFSCRIPT'
+        #!/bin/sh
+        
+        clear
+        echo "=========================================="
+        echo "  AUTO-WIPE STARTING..."
+        echo "  Manager: Amine"
+        echo "=========================================="
+        sleep 2
+        
+        # Find all disks (excluding USB)
+        DISKS=$(lsblk -dpno NAME,TYPE,TRAN | grep disk | grep -v usb | awk '{print $1}')
+        
+        if [ -z "$DISKS" ]; then
+            echo "❌ No disk found to wipe!"
+            sleep 5
+            poweroff
+        fi
+        
+        for DISK in $DISKS; do
+            echo ""
+            echo "🔍 Found disk: $DISK"
+            echo "📊 Current partitions:"
+            lsblk "$DISK" 2>/dev/null || true
+            
+            echo ""
+            echo "⚠️  WIPING $DISK in 3 seconds..."
+            echo "   Press Ctrl+C to cancel!"
+            sleep 3
+            
+            echo "🗑️  Deleting all partitions on $DISK..."
+            
+            # Nuclear option - delete everything
+            dd if=/dev/zero of="$DISK" bs=1M count=10 2>/dev/null || true
+            wipefs -af "$DISK" 2>/dev/null || true
+            sgdisk --zap-all "$DISK" 2>/dev/null || true
+            
+            # Try different methods to ensure partitions are gone
+            parted -s "$DISK" mklabel gpt 2>/dev/null || true
+            
+            # Delete all partitions one by one (fallback)
+            for part in $(parted -s "$DISK" print | grep '^ ' | awk '{print $1}' 2>/dev/null); do
+                parted -s "$DISK" rm "$part" 2>/dev/null || true
+            done
+            
+            # Create fresh GPT table
+            parted -s "$DISK" mklabel gpt
+            
+            # Create one big NTFS partition ready for Windows
+            parted -s "$DISK" mkpart primary ntfs 1MiB 100%
+            
+            sync
+            
+            echo "✅ $DISK wiped successfully!"
+            echo ""
+            echo "📊 New partition table:"
+            lsblk "$DISK"
+        done
+        
+        echo ""
+        echo "=========================================="
+        echo "  ✅ ALL GOOD!"
+        echo "  WIPED BY THE MANAGER: AMINE"
+        echo "=========================================="
+        echo ""
+        echo "Shutting down in 5 seconds..."
+        sleep 5
+        poweroff
+        EOFSCRIPT
+        
+        sudo chmod +x /tmp/alpine-new/scripts/autowipe.sh
+    
+    - name: Create overlay file for persistence
+      run: |
+        # Create the overlay structure
+        sudo mkdir -p /tmp/overlay/etc/local.d
+        sudo mkdir -p /tmp/overlay/usr/local/bin
+        
+        # Copy the wipe script
+        sudo cp /tmp/alpine-new/scripts/autowipe.sh /tmp/overlay/usr/local/bin/
+        
+        # Create autostart script
+        sudo tee /tmp/overlay/etc/local.d/autowipe.start > /dev/null << 'EOF'
+        #!/bin/sh
+        /usr/local/bin/autowipe.sh
+        EOF
+        sudo chmod +x /tmp/overlay/etc/local.d/autowipe.start
+        
+        # Create the apkovl (Alpine overlay)
+        cd /tmp/overlay
+        sudo tar czf /tmp/alpine-new/amine-wipe.apkovl.tar.gz *
+    
+    - name: Modify boot configuration for auto-start
+      run: |
+        # Modify syslinux config for automatic boot
+        sudo sed -i 's/TIMEOUT.*/TIMEOUT 10/' /tmp/alpine-new/boot/syslinux/syslinux.cfg
+        sudo sed -i 's/DEFAULT.*/DEFAULT autowipe/' /tmp/alpine-new/boot/syslinux/syslinux.cfg
+        
+        # Add our custom boot entry
+        sudo tee -a /tmp/alpine-new/boot/syslinux/syslinux.cfg > /dev/null << 'EOF'
+        
+        LABEL autowipe
+          MENU LABEL Alpine Auto-Wipe (by Amine)
+          KERNEL /boot/vmlinuz-lts
+          INITRD /boot/initramfs-lts
+          APPEND modules=loop,squashfs,sd-mod,usb-storage quiet alpine_mode=data autostart=/usr/local/bin/autowipe.sh
+        EOF
+    
+    - name: Create custom ISO
+      run: |
+        cd /tmp/alpine-new
+        sudo xorriso -as mkisofs \
+          -o /tmp/alpine-autowipe-amine.iso \
+          -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
+          -c boot/syslinux/boot.cat \
+          -b boot/syslinux/isolinux.bin \
+          -no-emul-boot \
+          -boot-load-size 4 \
+          -boot-info-table \
+          -eltorito-alt-boot \
+          -e boot/grub/efi.img \
+          -no-emul-boot \
+          -isohybrid-gpt-basdat \
+          -V "ALPINE_AUTOWIPE" \
+          .
+        
+        sudo chmod 644 /tmp/alpine-autowipe-amine.iso
+        sudo chown $(whoami):$(whoami) /tmp/alpine-autowipe-amine.iso
+    
+    - name: Move ISO to repository
+      run: |
+        mkdir -p ./build
+        mv /tmp/alpine-autowipe-amine.iso ./build/
+        
+        # Create info file
+        echo "Alpine Auto-Wipe ISO" > ./build/README.txt
+        echo "Built on: $(date)" >> ./build/README.txt
+        echo "Manager: Amine" >> ./build/README.txt
+        echo "" >> ./build/README.txt
+        echo "This ISO will automatically:" >> ./build/README.txt
+        echo "1. Boot Alpine Linux" >> ./build/README.txt
+        echo "2. Detect all hard drives (excluding USB)" >> ./build/README.txt
+        echo "3. Wipe all partitions" >> ./build/README.txt
+        echo "4. Create fresh GPT partition table" >> ./build/README.txt
+        echo "5. Create one NTFS partition ready for Windows" >> ./build/README.txt
+        echo "6. Power off when done" >> ./build/README.txt
+        echo "" >> ./build/README.txt
+        echo "⚠️  WARNING: This will DELETE ALL DATA on target drives!" >> ./build/README.txt
+    
+    - name: Upload ISO as artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: alpine-autowipe-iso
+        path: ./build/alpine-autowipe-amine.iso
+        retention-days: 90
+    
+    - name: Commit ISO to repository
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add ./build/
+        git commit -m "🔥 Built Alpine Auto-Wipe ISO - $(date '+%Y-%m-%d %H:%M:%S')" || echo "No changes to commit"
+        git push || echo "Nothing to push"
+    
+    - name: Create Release
+      uses: softprops/action-gh-release@v1
+      if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+      with:
+        tag_name: v1.0-${{ github.run_number }}
+        name: Alpine Auto-Wipe ISO v1.0-${{ github.run_number }}
+        body: |
+          🔥 Alpine Auto-Wipe ISO - Built by Amine
+          
+          **Features:**
+          - Automatic boot and wipe
+          - Deletes ALL partitions on all detected drives
+          - Creates fresh GPT + NTFS partition
+          - Powers off when complete
+          - Shows status messages during wipe
+          
+          **Usage:**
+          1. Download the ISO
+          2. Write to USB with Rufus (DD mode)
+          3. Boot target laptop from USB
+          4. Wait for "WIPED BY THE MANAGER: AMINE" message
+          5. Laptop will power off automatically
+          
+          ⚠️ **WARNING: Will permanently delete all data on target drives!**
+        files: |
+          ./build/alpine-autowipe-amine.iso
+          ./build/README.txt
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
